@@ -62,6 +62,33 @@ uvicorn app.main:app --reload
 ```
 브라우저에서 http://localhost:8000 접속
 
+### 문제 해결
+- **`OSError: [WinError 126] ... torch\lib\shm.dll`**: PC의 Visual C++ 런타임이 오래돼서 생깁니다. [Visual C++ 재배포 패키지(x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)를 설치한 뒤 터미널을 새로 열고 다시 실행하세요.
+- **`Failed to parse URL from /api/chat`**: `index.html`을 파일로 직접 연 경우입니다. 서버를 실행한 뒤 http://localhost:8000 으로 접속하세요.
+
+## API (사내 시스템 연동)
+
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| GET | `/` | 채팅 화면 (사내 포털에 `<iframe>`으로 삽입 가능) |
+| GET | `/api/health` | 준비 상태, 벡터DB 문서 수 |
+| POST | `/api/chat` | 질문 → 답변 (스트리밍) |
+
+`POST /api/chat` 요청:
+```json
+{"question": "대출 상담 시 신용조회 동의가 필요한가요?", "history": []}
+```
+응답은 한 줄에 JSON 하나씩 오는 NDJSON 스트림입니다.
+```
+{"type": "sources", "sources": [{"law": "...", "article": "제32조", "title": "...", "text": "...", "score": 0.81, ...}]}
+{"type": "delta", "text": "네, "}
+{"type": "delta", "text": "미리 개별적으로 동의를 받아야 합니다..."}
+{"type": "done"}
+```
+오류가 나면 `{"type": "error", "message": "..."}`가 옵니다.
+
+**답변 방식**: 질문과 비슷한 조문·가상 QnA를 검색한 뒤, 가상 QnA는 조문을 찾는 데만 쓰고 LLM에게는 **조문 원문**만 근거로 줍니다. 유사도가 `MIN_SCORE`보다 낮으면 LLM을 호출하지 않고 "관련 조문 없음"으로 답합니다.
+
 ## QnA 데이터 형식 (`data/qna/qna.jsonl`)
 ```json
 {"id": "PIPA-15-001", "law": "개인정보 보호법", "article": "제15조", "title": "개인정보의 수집·이용",

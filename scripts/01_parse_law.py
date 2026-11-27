@@ -40,6 +40,8 @@ HEADING_RE = re.compile(r"^\s*제\d+(?:장|절|관)(?:의\d+)?\s")
 ADDENDA_RE = re.compile(r"^\s*부\s*칙")
 # [시행 2025. 3. 13.]
 EFFECTIVE_RE = re.compile(r"\[시행\s*(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?\]")
+# 개정됐지만 아직 시행 전인 조문: 본문 끝에 "[시행일: 2027. 3. 9.] 제2조" 줄이 붙어 있음
+FUTURE_RE = re.compile(r"\[시행일\s*:\s*(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?\]")
 
 
 def read_text(path: Path) -> str:
@@ -62,15 +64,32 @@ def find_effective_date(text: str) -> str | None:
 def parse_law(text: str, law_name: str, prefix: str, law_type: str) -> list[dict]:
     effective_date = find_effective_date(text)
     articles: list[dict] = []
+    seen_ids: set[str] = set()
     current: dict | None = None
 
     def flush() -> None:
         if current is None:
             return
         body = "\n".join(line for line in current.pop("_lines") if line).strip()
-        if body:
-            current["text"] = body
-            articles.append(current)
+        if not body:
+            return
+        current["text"] = body
+        # 시행 예정 조문은 현행 조문과 구분: ID에 -F, 제목에 시행 예정일 표시
+        m = FUTURE_RE.search(body)
+        if m:
+            y, mo, d = m.groups()
+            current["effective_date"] = f"{y}-{int(mo):02d}-{int(d):02d}"
+            current["status"] = "시행예정"
+            current["title"] += f" [{y}. {int(mo)}. {int(d)}. 시행 예정]"
+            current["id"] += "-F"
+        else:
+            current["status"] = "현행"
+        base_id, n = current["id"], 2
+        while current["id"] in seen_ids:  # 그래도 겹치면 번호를 붙임
+            current["id"] = f"{base_id}-{n}"
+            n += 1
+        seen_ids.add(current["id"])
+        articles.append(current)
 
     for raw_line in text.splitlines():
         line = raw_line.strip()

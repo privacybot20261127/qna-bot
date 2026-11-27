@@ -7,7 +7,7 @@
 
 - 입력: data/processed/articles.jsonl  (01_parse_law.py 결과)
 - 출력: data/qna/qna.jsonl  (이어쓰기: 이미 생성된 조문은 건너뜀)
-- 필요: .env 의 ANTHROPIC_API_KEY
+- 필요: .env 의 LLM_PROVIDER, LLM_MODEL, API 키 (app/llm.py 참고)
 """
 
 from __future__ import annotations
@@ -20,17 +20,16 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import anthropic
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from app import llm  # noqa: E402
+
 IN_PATH = ROOT / "data" / "processed" / "articles.jsonl"
 OUT_PATH = ROOT / "data" / "qna" / "qna.jsonl"
 
-load_dotenv(ROOT / ".env")
-MODEL = os.getenv("LLM_MODEL", "claude-opus-5-5")
-EFFORT = os.getenv("QNA_EFFORT", "low")  # QnA 생성은 단순 작업이라 low로 속도·비용 절약
+EFFORT = os.getenv("QNA_EFFORT", "low")  # Claude 사용 시: QnA 생성은 단순 작업이라 low로 속도·비용 절약
 
 CATEGORIES = [
     "수집·이용", "제공·위탁", "동의", "파기·보유기간", "안전조치", "정보주체 권리",
@@ -48,6 +47,9 @@ SYSTEM_PROMPT = f"""당신은 신용협동조합중앙회 준법감시부의 직
   조문이 정의·총칙처럼 업무 상황과 거리가 멀면 개념을 묻는 질문으로 만듭니다.
 - 질문은 직원이 말하듯 자연스러운 한국어 한 문장으로 쓰고, 서로 다른 관점을 다룹니다.
 - 답변은 2~4문장으로 결론을 먼저 말하고, 끝에 근거를 "(근거: <법령명> <조문>)" 형식으로 적습니다.
+- 조문 제목에 "시행 예정"이 있으면 아직 시행 전인 개정 조문입니다. 답변 첫머리에 "(YYYY. M. D. 시행 예정 개정 조문 기준)"을 붙이고,
+  근거 표기에도 "시행 예정"을 적습니다.
+- 법령에 정의된 용어를 다른 말로 바꾸지 말고(예: 조문에 '검색'이면 '조회'로 바꾸지 않음) 조문의 표현을 그대로 씁니다.
 - 실존 인물·실제 개인정보는 쓰지 말고 필요하면 "조합원 A"처럼 씁니다.
 - category는 다음 중 하나를 고릅니다: {", ".join(CATEGORIES)}"""
 
@@ -69,26 +71,16 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def generate_for_article(client: anthropic.Anthropic, art: dict, n: int) -> list[dict]:
+def generate_for_article(art: dict, n: int) -> list[dict]:
     user_msg = (
         f"법령: {art['law']}\n조문: {art['article']}({art['title']})\n\n"
         f"<조문>\n{art['text']}\n</조문>\n\n"
-        f"이 조문으로 QnA {n}개를 만들어 주세요."
+        f"이 조문으로 QnA {n}개를 만들어 JSON으로 주세요."
     )
-    response = client.messages.parse(
-        model=MODEL,
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        output_config={"effort": EFFORT},
-        messages=[{"role": "user", "content": user_msg}],
-        output_format=QnASet,
-    )
-    if response.stop_reason == "refusal" or response.parsed_output is None:
-        print(f"[건너뜀] {art['id']}: stop_reason={response.stop_reason}", file=sys.stderr)
-        return []
+    result = llm.generate_json(SYSTEM_PROMPT, user_msg, QnASet, effort=EFFORT)
 
     rows = []
-    for i, item in enumerate(response.parsed_output.items[:n], start=1):
+    for i, item in enumerate(result.items[:n], start=1):
         rows.append({
             "id": f"{art['id']}-Q{i:02d}",
             "article_id": art["id"],
@@ -121,28 +113,31 @@ def main() -> int:
     todo = [a for a in articles if a["id"] not in done]
     if args.limit:
         todo = todo[: args.limit]
-    print(f"전체 {len(articles)}개 조문 중 완료 {len(done)}개, 이번에 처리할 조문 {len(todo)}개 (모델 {MODEL})")
+    print(f"전체 {len(articles)}개 조문 중 완료 {len(done)}개, 이번에 처리할 조문 {len(todo)}개 (모델 {llm.describe()})")
     if not todo:
         return 0
 
-    client = anthropic.Anthropic()  # ANTHROPIC_API_KEY를 환경변수(.env)에서 읽음
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
     created = failed = 0
 
     with OUT_PATH.open("a", encoding="utf-8") as out, ThreadPoolExecutor(args.workers) as pool:
-        futures = {pool.submit(generate_for_article, client, a, args.per_article): a for a in todo}
+        futures = {pool.submit(generate_for_article, a, args.per_article): a for a in todo}
         for idx, fut in enumerate(as_completed(futures), start=1):
             art = futures[fut]
             try:
                 rows = fut.result()
-            except anthropic.AuthenticationError:
-                print("API 키가 올바르지 않습니다. .env의 ANTHROPIC_API_KEY를 확인하세요.", file=sys.stderr)
-                pool.shutdown(cancel_futures=True)
-                return 1
-            except anthropic.APIError as e:
+            except llm.LLMError as e:
+                if e.kind in ("auth", "config"):  # 설정 문제는 모든 조문이 실패하므로 즉시 중단
+                    print(f"[중단] {e}", file=sys.stderr)
+                    pool.shutdown(cancel_futures=True)
+                    return 1
                 failed += 1
                 print(f"[실패] {art['id']}: {e}", file=sys.stderr)
+                continue
+            except ValidationError as e:
+                failed += 1
+                print(f"[실패] {art['id']}: 응답 형식 오류 ({e.error_count()}건)", file=sys.stderr)
                 continue
             with lock:
                 for row in rows:
